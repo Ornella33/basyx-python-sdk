@@ -3,17 +3,55 @@ name: ci
 on: [push, pull_request]
 
 env:
-  X_PYTHON_VERSION: "3.12"
+  X_PYTHON_MIN_VERSION: "3.9"
+  X_PYTHON_MAX_VERSION: "3.12"
 
 jobs:
-  test:
+  check-python-versions:
+    # This job checks that the Python Versions we support match and are not End of Life
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./etc/scripts
+    steps:
+      - uses: actions/checkout@v2
+      - name: Set up Python ${{ env.X_PYTHON_MIN_VERSION }}
+        uses: actions/setup-python@v2
+        with:
+          python-version: ${{ env.X_PYTHON_MIN_VERSION }}
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r ./check_python_versions_requirements.txt
+      - name: Check Supported Python Versions
+        run: |
+          python check_python_versions_supported.py \
+            ${{ env.X_PYTHON_MIN_VERSION }} \
+            ${{ env.X_PYTHON_MAX_VERSION }}
+
+      - name: Check Python Versions coincide with the SDKs pyproject.toml
+        run: |
+          python check_python_versions_coincide.py \
+            ../../sdk/pyproject.toml \
+            ${{ env.X_PYTHON_MIN_VERSION }} \
+            ${{ env.X_PYTHON_MAX_VERSION }}
+
+      # Todo: Check other pyproject.toml here as well, as we add them
+
+  sdk-test:
+    # This job runs the unittests on the python versions specified down at the matrix
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.8", "3.10", "3.12"]
+        python-version: ["3.9", "3.12"]
     env:
       COUCHDB_ADMIN_PASSWORD: "yo0Quai3"
-      AAS_SPECS_RELEASE_TAG: "V3.0.7"
+      # (2024-10-11, s-heppner)
+      # Specify the tag of the released schema files from https://github.com/admin-shell-io/aas-specs/releases
+      # that you want to use to test the serialization adapter against.
+      # Currently, we need to update this manually, however I'm afraid this is not possible to automatically infer,
+      # since it's heavily dependant of the version of the AAS specification we support.
+      AAS_SPECS_RELEASE_TAG: "IDTA-01001-3-0-1_schemasV3.0.8"
     services:
       couchdb:
         image: couchdb:3
@@ -22,11 +60,19 @@ jobs:
         env:
           COUCHDB_USER: "admin"
           COUCHDB_PASSWORD: ${{ env.COUCHDB_ADMIN_PASSWORD }}
-
+    defaults:
+      run:
+        working-directory: ./sdk
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
+    - name: Verify Matrix Version matches Global Version
+      run: |
+        if [ "${{ matrix.python-version }}" != "${{ env.X_PYTHON_MIN_VERSION }}" ] && [ "${{ matrix.python-version }}" != "${{ env.X_PYTHON_MAX_VERSION }}" ]; then
+          echo "Error: Matrix version ${{ matrix.python-version }} does not match global version."
+          exit 1
+        fi
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@v4
       with:
         python-version: ${{ matrix.python-version }}
     - name: Collect schema files from aas-specs
@@ -37,8 +83,7 @@ jobs:
     - name: Install Python dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install coverage
-        pip install -r requirements.txt
+        pip install .[dev]
     - name: Setup test config and CouchDB database server
       run: |
         python test/_helper/setup_testdb.py -u "admin" -p "$COUCHDB_ADMIN_PASSWORD"
@@ -50,9 +95,133 @@ jobs:
       run: |
         coverage report -m
 
-  static-analysis:
+  sdk-static-analysis:
+    # This job runs static code analysis, namely pycodestyle and mypy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./sdk
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python ${{ env.X_PYTHON_MIN_VERSION }}
+      uses: actions/setup-python@v2
+      with:
+        python-version: ${{ env.X_PYTHON_MIN_VERSION }}
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install .[dev]
+    - name: Check typing with MyPy
+      run: |
+        mypy basyx test
+    - name: Check code style with PyCodestyle
+      run: |
+        pycodestyle --count --max-line-length 120 basyx test
+
+  sdk-readme-codeblocks:
+    # This job runs the same static code analysis (mypy and pycodestyle) on the codeblocks in our docstrings.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./sdk
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python ${{ env.X_PYTHON_MIN_VERSION }}
+      uses: actions/setup-python@v2
+      with:
+        python-version: ${{ env.X_PYTHON_MIN_VERSION }}
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install .[dev]
+    - name: Check typing with MyPy
+      run: |
+        mypy <(codeblocks python README.md)
+    - name: Check code style with PyCodestyle
+      run: |
+        codeblocks --wrap python README.md | pycodestyle --count --max-line-length 120 -
+    - name: Run readme codeblocks with Python
+      run: |
+        codeblocks python README.md | python
+
+  sdk-docs:
+    # This job checks, if the automatically generated documentation using sphinx can be compiled
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./sdk
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python ${{ env.X_PYTHON_MIN_VERSION }}
+      uses: actions/setup-python@v2
+      with:
+        python-version: ${{ env.X_PYTHON_MIN_VERSION }}
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install .
+        pip install -r docs/add-requirements.txt
+    - name: Check documentation for errors
+      run: |
+        SPHINXOPTS="-a -E -n -W --keep-going" make -C docs html
+
+  sdk-package:
+    # This job checks if we can build our SDK package
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./sdk
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python ${{ env.X_PYTHON_MIN_VERSION }}
+      uses: actions/setup-python@v2
+      with:
+        python-version: ${{ env.X_PYTHON_MIN_VERSION }}
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install build
+    - name: Create source and wheel dist
+      run: |
+        python -m build
+
+
+  compliance-tool-test:
+    # This job runs the unittests on the python versions specified down at the matrix
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.8", "3.10", "3.12"]
+    defaults:
+      run:
+        working-directory: ./compliance_tool
+
+    steps:
+    - uses: actions/checkout@v2
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v2
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install coverage
+        pip install -r requirements.txt
+    - name: Test with coverage + unittest
+      run: |
+        coverage run --source=aas_compliance_tool -m unittest
+    - name: Report test coverage
+      if: ${{ always() }}
+      run: |
+        coverage report -m
+
+  compliance-tool-static-analysis:
+    # This job runs static code analysis, namely pycodestyle and mypy
     runs-on: ubuntu-latest
 
+    defaults:
+      run:
+        working-directory: ./compliance_tool
     steps:
     - uses: actions/checkout@v2
     - name: Set up Python ${{ env.X_PYTHON_VERSION }}
@@ -66,14 +235,18 @@ jobs:
         pip install -r requirements.txt
     - name: Check typing with MyPy
       run: |
-        mypy basyx test
+        mypy ./aas_compliance_tool test
     - name: Check code style with PyCodestyle
       run: |
-        pycodestyle --count --max-line-length 120 basyx test
+        pycodestyle --count --max-line-length 120 ./aas_compliance_tool test
 
-  readme-codeblocks:
+  compliance-tool-readme-codeblocks:
+    # This job runs the same static code analysis (mypy and pycodestyle) on the codeblocks in our docstrings.
     runs-on: ubuntu-latest
 
+    defaults:
+      run:
+        working-directory: ./compliance_tool
     steps:
     - uses: actions/checkout@v2
     - name: Set up Python ${{ env.X_PYTHON_VERSION }}
@@ -95,27 +268,13 @@ jobs:
       run: |
         codeblocks python README.md | python
 
-  docs:
+  compliance-tool-package:
+    # This job checks if we can build our compliance_tool package
     runs-on: ubuntu-latest
 
-    steps:
-    - uses: actions/checkout@v2
-    - name: Set up Python ${{ env.X_PYTHON_VERSION }}
-      uses: actions/setup-python@v2
-      with:
-        python-version: ${{ env.X_PYTHON_VERSION }}
-    - name: Install Python dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install -r docs/add-requirements.txt
-    - name: Check documentation for errors
-      run: |
-        SPHINXOPTS="-a -E -n -W --keep-going" make -C docs html
-
-  package:
-    runs-on: ubuntu-latest
-
+    defaults:
+      run:
+        working-directory: ./compliance_tool
     steps:
     - uses: actions/checkout@v2
     - name: Set up Python ${{ env.X_PYTHON_VERSION }}
@@ -129,3 +288,32 @@ jobs:
     - name: Create source and wheel dist
       run: |
         python setup.py sdist bdist_wheel
+
+  server-package:
+    # This job checks if we can build our server package
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./server
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the Docker image
+        run: |
+          docker build -t basyx-python-server .
+      - name: Run container
+        run: |
+           docker run -d --name basyx-python-server basyx-python-server
+      - name: Wait for container and server initialization
+        run: |
+          timeout 30s bash -c '
+            until docker logs basyx-python-server 2>&1 | grep -q "INFO success: quit_on_failure entered RUNNING state"; do
+              sleep 2
+            done
+          '
+      - name: Check if container is running
+        run: |
+          docker inspect --format='{{.State.Running}}' basyx-python-server | grep true
+      - name: Stop and remove the container
+        run: |
+          docker stop basyx-python-server && docker rm basyx-python-server
+
